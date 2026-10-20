@@ -1,0 +1,186 @@
+# =============================================================================
+# Dev_Skill SIH 2026 - Root .gitignore
+# Covers: dev_skill_backend (Python/FastAPI), dev_skill_center (Next.js), dev_skill_govt (Next.js)
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Python / Backend (dev_skill_backend)
+# -----------------------------------------------------------------------------
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.venv_backend/
+
+# Python package/build artifacts
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+.uv/
+
+# PyInstaller
+*.spec
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# PyCharm / IDE
+.idea/
+*.swp
+*.swo
+
+# -----------------------------------------------------------------------------
+# Node.js / Frontend (dev_skill_center, dev_skill_govt)
+# -----------------------------------------------------------------------------
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Yarn
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+
+# pnpm
+pnpm-store/
+
+# Testing
+coverage/
+
+# Next.js
+.next/
+out/
+build/
+
+# Production
+dist/
+
+# Misc
+.DS_Store
+*.pem
+
+# Debug logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# Environment files (SENSITIVE - never commit)
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+.env.*.local
+
+# Vercel
+.vercel
+
+# TypeScript
+*.tsbuildinfo
+next-env.d.ts
+
+# Turbo
+.turbo/
+
+# -----------------------------------------------------------------------------
+# Backend Specific (dev_skill_backend)
+# -----------------------------------------------------------------------------
+# Model weights (large files - use Git LFS or external storage)
+*.pt
+*.onnx
+*.engine
+*.trt
+weights/
+*.bin
+
+# Data directories
+data/
+eval/
+sample_videos/
+
+# Database / migrations
+*.db
+*.sqlite
+*.sqlite3
+migrations/versions/
+alembic.ini
+
+# Logs
+*.log
+logs/
+*.out
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# -----------------------------------------------------------------------------
+# Sensitive / Secrets (NEVER COMMIT)
+# -----------------------------------------------------------------------------
+# MongoDB / Database credentials
+**/mongo*.uri
+**/mongodb*.uri
+**/atlas*.uri
+
+# API Keys
+**/api_keys.*
+**/secrets.*
+**/credentials.*
+
+# SSL / Certificates
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+
+# JWT Secrets
+**/jwt*.secret
+**/secret*.key
+
+# -----------------------------------------------------------------------------
+# OS / Editor
+# -----------------------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# -----------------------------------------------------------------------------
+# Project Specific - Large Assets
+# -----------------------------------------------------------------------------
+dev_skill_backend/yolo*.pt
+dev_skill_backend/yolov8*.pt
+dev_skill_backend/weights/
+dev_skill_backend/sample_videos/
+dev_skill_backend/data/
+*.zip
+
+# -----------------------------------------------------------------------------
+# Documentation / Planning (Optional - keep if needed for repo)
+# -----------------------------------------------------------------------------
+# *.md files in root are OK to commit
+# dev_skill_backend/backendPlan*.md
+# dev_skill_center/centerPortal*.md
+# dev_skill_govt/govtPortal*.md

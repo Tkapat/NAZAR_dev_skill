@@ -1,0 +1,804 @@
+==================================================================
+ dev_skill_backend: PLAN AND SPEC  v3
+ (FastAPI + MongoDB Atlas + YOLO + own JWT auth + LIVE MONITOR + CALENDAR)
+ Give with: Backend key code, M1-M4, "Backend additions for Centre portal v2".
+ Where this block and older blocks disagree, THIS block wins.
+==================================================================
+
+RULES FOR THE AI BUILDER (read first, obey exactly)
+------------------------------------------------------------------
+ 1. Python 3.10 or 3.11. FastAPI + Uvicorn. Sync endpoints (def) are
+    fine; run heavy vision work in a thread pool, never inside an async
+    def body (use starlette.concurrency.run_in_threadpool). File upload
+    endpoints may be async.
+ 2. There is NO Supabase. Database = MongoDB Atlas via PyMongo (sync),
+    ONE cluster, ONE database "devskill". MONGODB_URI, JWT_SECRET,
+    FERNET_KEY, FILE_URL_SECRET live only in backend .env and are never
+    returned or logged.
+ 3. Frontends only call this API. Every endpoint uses
+    Depends(require(...roles...)) except the PUBLIC ones listed.
+ 4. Centre-side roles may only touch documents whose centre_id equals
+    user["centre_id"]. Call assert_centre_access() or filter by
+    centre_id in EVERY centre route. Never trust a centre_id sent by
+    the client; take it from the token's user.
+ 5. All timestamps = timezone-aware UTC datetimes. Date-only values are
+    "YYYY-MM-DD" strings (calendar dates are IST dates), time-of-day
+    values are "HH:MM" strings.
+ 6. Raw frames are NEVER written to disk or database, never logged, never
+    returned. Only blurred, annotated, resized JPEG thumbnails (<=60 KB)
+    may be saved. Frames pushed by the browser are decoded in memory,
+    processed and dropped. The camera reference frame is blurred with
+    the same privacy function before storage.
+ 7. Never store plain passwords. Temporary passwords are returned once.
+ 8. Errors: {"detail": {"detail": "...", "code": "SOME_CODE"}} via
+    HTTPException(status, detail={...}). 401, 403, 404, 409, 422, 429.
+ 9. Do not invent collections or fields. Use only the shapes in the
+    COLLECTIONS section. Ask before changing a shape.
+10. Every state-changing officer/admin action writes to audit_log
+    (insert-only). Live snapshots are NOT audit-logged (volume) but are
+    covered by ledger batch digests (see INTEGRITY).
+11. Thresholds live in trade_templates / camera.live, not in code.
+12. IDs: store ObjectId internally; return strings under key "id".
+    Parse incoming ids with oid() (422 BAD_ID).
+13. Lists: ?limit=25 (max 100) and ?cursor=<last id>. Never skip().
+    Return {"items":[...],"next_cursor":..}.
+14. No DB triggers: invariants are enforced in code.
+15. Public routes are rate limited (slowapi 20/min/IP; login 10/min).
+    The frame endpoint is NOT subject to the default limiter; it has its
+    own per-camera minimum spacing (0.5 x interval, 429 TOO_FAST).
+16. Do not add features not listed.
+17. LIVE PATH MUST BE FAST: target <= 1.5 s per frame on a 2-vCPU CPU
+    (yolo11n, tiling OFF by default for live frames). Cap concurrent
+    inference with a semaphore (2). If busy return {"accepted":false,
+    "reason":"BUSY"} (HTTP 200), never queue.
+18. SERVER TIME ONLY: snapshot timestamps are server time, never client
+    time. Calendar dates are computed in Asia/Kolkata.
+19. WRITE FALLBACK: if Atlas is unreachable (exception/timeout 3 s), a
+    snapshot or observation is appended to the local ledger (kind
+    "snapshot"/"observation") and replayed by sync_tick. live_status is
+    best-effort (skipped when offline).
+20. Provisional cameras (setup_status != approved) update live_status
+    only. They never write snapshots, timelines, summaries or flags.
+
+FOLDER STRUCTURE
+------------------------------------------------------------------
+ dev_skill_backend/
+   .env  requirements.txt  README.md
+   scripts/init_db.py          (indexes, validators, seed, first admin)
+   models/  sample_videos/  data/  eval/
+   app/
+     main.py
+     core/    config.py security.py deps.py audit.py limiter.py
+     db/      mongo.py local.py
+     routers/ auth.py applications.py centres.py schemes.py users.py
+              cameras.py schedule.py trainees.py attendance.py staff.py
+              equipment.py requests.py flags.py notices.py reports.py
+              files.py edge.py
+              live.py        (NEW: frame push, live status, demo session)
+              calendar.py    (NEW: calendar range, day detail, snapshots)
+     services/ credentials.py ledger.py sync.py consolidate.py
+               flag_engine.py face.py plausibility.py scheduler.py
+               pipeline.py dbfuncs.py files_store.py
+               live.py            (NEW: process_live_frame, consolidate_session)
+               live_capture.py    (NEW: server-side webcam/RTSP loop)
+               calendar.py        (NEW: aggregations)
+               vision/ detector.py quality.py cleanup.py privacy.py
+                       usage.py   (NEW: per-item in-use logic; replaces equipment.py)
+
+ENVIRONMENT (.env)
+------------------------------------------------------------------
+ MONGODB_URI=mongodb+srv://<user>:<urlencoded-pass>@<cluster>.mongodb.net/?retryWrites=true&w=majority
+ MONGODB_DB=devskill
+ JWT_SECRET=<64+ chars>        FILE_URL_SECRET=<64+ chars, different>
+ FERNET_KEY=...  EDGE_SIGNING_KEY_HEX=<64 hex>  DEVICE_ID=edge-001
+ ALLOWED_ORIGINS=http://localhost:3000,http://localhost:3001,https://<gov>.vercel.app,https://<center>.vercel.app
+ FORCE_OFFLINE=false
+ LIVE_DEFAULT_INTERVAL_S=10        # demo; use 30-60 for real centres
+ LIVE_TIMELINE_GAP_S=30            # min seconds between stored timeline points
+ LIVE_SNAPSHOT_TTL_DAYS=14
+ ROUTINE_EVIDENCE_EVERY_MIN=15     # one blurred thumbnail kept per N minutes
+ CONSOLIDATE_EVERY_SNAPSHOTS=20
+ (config.py gets the matching fields; .env is in .gitignore.)
+
+REQUIREMENTS (requirements.txt)
+------------------------------------------------------------------
+ fastapi, uvicorn[standard], pydantic-settings, python-dotenv,
+ pymongo[srv], PyJWT, argon2-cffi, pyotp, slowapi, cachetools,
+ apscheduler, python-multipart, httpx, ultralytics,
+ opencv-python-headless, numpy, pillow, insightface, onnxruntime,
+ cryptography, torch/torchvision (CPU build recommended:
+ pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu)
+ (NO supabase. insightface fallback: deepface behind the same face.py
+  interface.)
+
+RUN AND EXPOSE
+------------------------------------------------------------------
+ python -m scripts.init_db                 (once; safe to re-run)
+ uvicorn app.main:app --host 0.0.0.0 --port 8000
+ HTTPS is REQUIRED for the frontends (Vercel is https; browsers block
+ http calls and getUserMedia needs https): use an ngrok reserved domain,
+ Cloudflare Tunnel, or Caddy in front of uvicorn.
+ CORS: exact frontend origins. Frontends send "ngrok-skip-browser-warning: true".
+ Startup (main.py): sync.register_device(); scheduler.start().
+ Scheduler jobs (APScheduler, max_instances=1 each):
+   sync_tick                 every 20 s
+   session_status_tick       every 60 s  (scheduled->active->closed/missed;
+                             on closing: consolidate_session(final=True),
+                             C3 check, fill sessions.summary)
+   live_capture_tick         every 5 s   (server-side cameras only, see below)
+   expire_repairs            daily
+   generate_sessions         nightly (next 14 days)
+   daily_rollup_fix          hourly (recompute today's daily_summaries.flags_*)
+
+AUTH MODEL (own, unchanged from v2)
+------------------------------------------------------------------
+ POST /auth/login {login_id, password} (govt login_id = email; centre
+ DSK-WB-0001 / DSK-WB-0001-T01). Lockout after 5 failures for 15 min
+ (429 ACCOUNT_LOCKED). TOTP MFA for govt roles. Access JWT 30 min +
+ one-time rotating refresh 7 days (hashed, TTL). Password change or reset
+ bumps users.token_version. must_change_password blocks everything but
+ GET /me and POST /me/change-password; expiry -> 403 CREDENTIALS_EXPIRED.
+ Password rule: >=10 chars, upper, lower, digit, special.
+ Roles: super_admin, scheme_officer, auditor (GET only), centre_admin,
+ trainer.
+
+LIVE MONITORING AND CALENDAR (core of v3)
+------------------------------------------------------------------
+ A. CAMERA SOURCE KINDS  (cameras.source_kind, derived from source_uri)
+    browser        source_uri "browser". A browser tab (Centre portal
+                   /live) captures frames and POSTs them. Works with the
+                   backend anywhere (laptop, Azure VM).
+    webcam         source_uri "webcam:0". Backend reads the machine's
+                   own webcam with cv2.VideoCapture(index) (on Windows
+                   use cv2.CAP_DSHOW). Only works when the backend runs
+                   on that PC.
+    rtsp           rtsp://... read by the backend.
+    file           "file:<name>" from sample_videos/ (Demo Lab only,
+                   never in live_capture_tick).
+    Per-camera live settings: cameras.live = {enabled, interval_s (5..120),
+    tiling(bool, default false)}; cameras.subtract_staff(bool, default true
+    for the first camera of a centre); cameras.zone_label (text).
+    MULTIPLE CAMERAS: each camera must cover a different area. Session
+    observed count = SUM over cameras (ci_low/ci_high summed).
+
+ B. FRAME FLOW (process_live_frame; see KEY CODE)
+    1 Resolve camera, centre, template, ACTIVE session (now between
+      start_ts and end_ts) or None.
+    2 Quality gate (dark/covered/blurry/frozen). Bad frame: live_status
+      state "tampered", camera_health event (only on state change), after
+      3 consecutive bad frames inside a session raise C1 (deduped).
+      Bad frames are never counted.
+    3 Detect (full frame; tiling only if camera.live.tiling) -> cleanup
+      (ROI, presence rule, staff subtraction) -> item_usage().
+    4 Per-snapshot output:
+        people            counted people (after rule + staff subtraction)
+        people_raw        people boxes inside ROI before the rule
+        items {class: {present, in_use, idle, off}}
+        people_smooth     median of the last 5 snapshots (what UIs show big)
+    5 Thumbnail: heads blurred, boxes + labels drawn, 640 px, JPEG q60.
+      Saved as evidence_blobs _id "live_<camera_id>" (replace, expire 1 day)
+      every frame; plus ONE routine thumbnail every ROUTINE_EVIDENCE_EVERY_MIN
+      minutes (kind "routine", expire 14 days).
+    6 live_status upserted (always). If camera approved AND session active:
+      insert snapshots doc, update day_timelines (max one point per
+      LIVE_TIMELINE_GAP_S), daily_summaries ($inc/$max/$min), sessions
+      done_captures. Every CONSOLIDATE_EVERY_SNAPSHOTS recordable snapshots
+      (and at session close) run consolidate_session().
+    7 Response to the browser: {accepted, state, session, people,
+      people_smooth, items, boxes[{cls,x1,y1,x2,y2,conf}] normalised 0..1
+      (for drawing on the LOCAL preview), next_interval_s}.
+
+ C. IN-USE DEFINITION (usage.py; per item, per snapshot)
+    present   detected inside the camera ROI.
+    in_use    a person box (expanded 15 %) overlaps the item box; for
+              operability "screen_on" classes (monitor/laptop/tv) the
+              screen must ALSO be on (brightness > 70 or std > 35).
+    off       screen class, screen not on.
+    idle      present, not off, nobody near.
+    operability "none" = count presence only (no usage states).
+    Session usage % per class = mean(in_use) / mean(present) over snapshots.
+
+ D. CONSOLIDATION AND FLAGS (rolling)
+    consolidate_session(session_id, camera, final):
+      counts = last max_frames snapshots' people; consolidate() with the
+      template tolerance/agree_ratio; equipment per class from present
+      counts (min_frames 3) plus in_use_pct. Upsert observations
+      {source:"live"} keyed (session_id, camera_id, hour_bucket); ledger
+      entry only when observed/ci/state changed.
+      Flag evaluation (flag_engine.evaluate) runs only when frames_used
+      >= base_frames. U1 and C3 are raised only when final=True (session
+      closed). Flags are upserted by dedupe_key
+      "<session_id>:<type>[:<class>]": existing open flag -> update
+      reason/details; new -> insert + ledger("flag") + recompute_risk.
+      Claim may arrive after capture started: evaluation simply uses the
+      claim when it exists.
+      sessions.summary = {claimed, observed, ci_low, ci_high, state, delta,
+      snapshots, staff_verified} is rewritten after each consolidation.
+
+ E. CALENDAR DATA MODEL (calendar.py)
+    Per snapshot we update, in this order: snapshots (14 d TTL),
+    day_timelines (downsampled points, kept), daily_summaries (kept).
+    "updates" for a day = snapshots + claims + flags + camera health
+    events + session open/close events.
+    Day status (computed at read time, no extra storage):
+      holiday   date in holidays
+      upcoming  date > today (and sessions scheduled)
+      none      no sessions and no data
+      no_data   sessions scheduled but no snapshots
+      critical  any flag high/critical that day
+      attention any open flag that day
+      ok        data present, no open flags
+    Range endpoint merges THREE grouped queries (daily_summaries, sessions
+    grouped by date, flags grouped by IST date). No per-day queries.
+
+ F. STALENESS
+    live_status.ts older than 3 x interval -> API reports state "offline".
+    No active session and fresh frames -> state "idle". Provisional
+    camera -> state "provisional". Healthy + session -> "live".
+
+ G. SERVER-SIDE CAPTURE (live_capture_tick, webcam/rtsp only)
+    For each camera with live.enabled, kind webcam|rtsp, a centre that is
+    live/pending_setup and an ACTIVE session: if now - last_snapshot >=
+    interval -> read one frame from a cached cv2.VideoCapture (opened
+    lazily, released after 60 s idle or on error, retried every 30 s) and
+    call process_live_frame(). Cameras are enabled/disabled via
+    PUT /my/cameras/{id}/live.
+
+COLLECTIONS (the only data shapes allowed)
+------------------------------------------------------------------
+ Notation: oid, dt = UTC datetime, d = "YYYY-MM-DD", t = "HH:MM".
+ Indexes/validators/TTLs are in scripts/init_db.py (see DELTAS).
+
+ users, refresh_tokens, counters, schemes, applications, centres, staff,
+ staff_faces, batches, holidays, trainees, attendance_claims,
+ staff_attendance, camera_health_events, frame_fingerprints, edge_devices,
+ ledger_entries, repair_declarations, change_requests, notices, audit_log
+   -> UNCHANGED from v2 shapes.
+
+ trade_templates {scheme_id, trade_name, detector_classes[str CANONICAL
+   names: person chair desk monitor laptop keyboard mouse "cell phone"
+   book bottle bench couch + any open-vocab class], detector_backend:
+   auto|coco|world (default auto), equipment_rules[{class,label,
+   min_units_per_trainee,operability: none|screen_on|in_use,required}],
+   presence_rule: seated|workstation|any, count_tolerance(0-5),
+   agree_ratio(0.5-1), min_confidence(0.05-0.95), base_frames(>=5),
+   step_frames(>=1), max_frames(>=base), active}
+
+ cameras {centre_id, name, source_uri, source_kind: browser|webcam|rtsp|file,
+   resolution, roi_polygon[[x,y]]|null, zones[{name,polygon}]|null,
+   zone_label?, subtract_staff, live{enabled,interval_s,tiling},
+   reference_phash?, reference_blob_id?, setup_status: draft|submitted|
+   approved|rejected, reject_reason?, submitted_at?, decided_by?,
+   decided_at?, status: unknown|online|offline|tampered,
+   last_tamper_reason?, last_seen?, created_at}
+
+ sessions {centre_id, batch_id|null, kind: scheduled|adhoc, label,
+   session_date(d), start_ts, end_ts, status: scheduled|active|closed|missed,
+   planned_captures, done_captures, summary{claimed,observed,ci_low,ci_high,
+   state,delta,snapshots,staff_verified}|null}
+   (adhoc sessions are created by POST /my/live/demo-session)
+
+ live_status {_id = camera_id, centre_id, centre_code, centre_name, district,
+   camera_name, state: live|idle|tampered|provisional, ts, interval_s,
+   session{id,label,start_ts,end_ts}|null, people, people_smooth,
+   items{class:{present,in_use,idle,off}}, quality{ok,reasons[]},
+   claimed|null, model_version, latency_ms, thumb_id}
+
+ snapshots {centre_id, camera_id, session_id, ts, people, people_raw,
+   items{class:{present,in_use,idle,off}}, quality{ok,reasons[]},
+   model_version, latency_ms, snap_key(unique = camera_id|ts_ms)}
+   TTL: ts + LIVE_SNAPSHOT_TTL_DAYS.
+
+ day_timelines {centre_id, camera_id, date(d), points[{ts, people,
+   items{class:{present,in_use}}}] (max 2000, $slice -2000), updated_at}
+   unique (camera_id, date). Kept (small).
+
+ daily_summaries {centre_id, date(d), snapshots, people_sum, people_max,
+   first_seen, last_seen, items{class:{present_sum, in_use_sum, present_max}},
+   claims, health_events, updated_at}  unique (centre_id, date). Kept.
+   Derived at read time: people_avg = people_sum/snapshots,
+   in_use_pct = in_use_sum/present_sum.
+
+ observations {centre_id, session_id, camera_id, hour_bucket, source:
+   live|demo, observed_count|null, ci_low, ci_high, state: ok|uncertain,
+   frames_used, per_frame_counts[], equipment{class:{observed,ci_low,
+   ci_high,consistent,in_use_pct,status}}, tamper[], model_version,
+   ledger_hash?}
+
+ evidence_blobs {_id string, centre_id, session_id?, camera_id?, kind:
+   live|routine|flag|reference, data(Binary<=60KB), created_at, expire_at}
+   (TTL on expire_at: live +1 d, routine +14 d, flag +90 d, reference +365 d)
+
+ flags {... v2 shape ..., camera_id?, dedupe_key?(unique sparse),
+   events[{...}], evidence_ids[]}
+
+ RESPONSE RULES: flags return evidence_urls[]; live_status returns
+ thumb_url = sign_file_url("evidence", thumb_id); calendar evidence rows
+ return url. Never expose raw ids as URLs, password hashes, mfa secrets
+ or embeddings.
+
+API ENDPOINTS (JSON; * = write)
+------------------------------------------------------------------
+ (All v2 endpoints remain: public, auth, me, files, govt, centre, edge,
+  system. Only ADDED or CHANGED endpoints are listed below, then the
+  unchanged v2 list in short.)
+
+ NEW / CHANGED  ---  CENTRE (centre_admin, trainer; own centre)
+  POST /my/cameras*                {name, source_uri ("browser"|"webcam:0"|
+                                   "rtsp://..."|"file:x.mp4"), resolution,
+                                   zone_label?}  -> sets source_kind, live
+                                   defaults; first camera subtract_staff=true
+  PUT  /my/cameras/{id}/live*      {enabled, interval_s, tiling}
+  POST /my/cameras/{id}/reference-frame*   multipart "file" (browser cameras):
+                                   decode, blur heads, store evidence_blobs
+                                   "ref_<id>" kind reference, compute quality
+                                   + phash + width/height
+  GET  /my/cameras/{id}/reference-frame    {url,width,height,quality{
+                                   brightness,sharpness,coverage}}
+                                   (webcam/rtsp/file: grabs a frame itself)
+  POST /my/cameras/{id}/frame*     multipart "file" (JPEG <= 1.5 MB, <=1920 px).
+                                   browser cameras only. Errors: 404, 403
+                                   CENTRE_INACTIVE, 422 BAD_FILE/FILE_TOO_LARGE,
+                                   429 TOO_FAST. Returns the response in LIVE B.7.
+  GET  /my/live                    live_status for own cameras (+ state with
+                                   staleness applied, spark[30])
+  POST /my/live/demo-session*      {minutes: 15..180, label?} creates an ad-hoc
+                                   session starting now (status active) so the
+                                   monitor works without a timetable. Max 3
+                                   ad-hoc sessions per day. Audit-logged.
+  GET  /my/calendar?from=&to=      CalendarDay[] (<= 400 days)
+  GET  /my/calendar/{date}         DayDetail
+  GET  /my/calendar/{date}/snapshots?limit=&cursor=   raw snapshot rows
+  GET  /my/centre                  (v2) now also {live_summary}
+ NEW  ---  GOVT (read: super_admin, scheme_officer, auditor)
+  GET  /live?district=&state=&q=   all live_status rows (joined), counts
+                                   {live, idle, offline, tampered,
+                                   provisional}, staleness applied, spark[30]
+  GET  /centres/{id}/live          rows for the centre's cameras + today's
+                                   timeline (<=240 points) + latest flags
+  GET  /centres/{id}/calendar?from=&to=      CalendarDay[]
+  GET  /centres/{id}/calendar/{date}         DayDetail
+  GET  /centres/{id}/calendar/{date}/snapshots?limit=&cursor=
+  GET  /centres/{id}/evidence?from=&to=      (v2) now supports date filter
+ UNCHANGED (v2): public applications/documents/track/schemes, auth, /me*,
+  /files, schemes/templates, applications approve/reject/query, centres
+  CRUD/reset/status/attendance/equipment/timeline, cameras approve/reject,
+  flags + actions + bulk-acknowledge, requests, notices, reports, audit-log,
+  accuracy, users, my/batches, my/holidays, my/trainees (+bulk,deactivate,
+  reactivate), my/staff (+face), my/sessions (today, staff-scan, claim),
+  my/equipment, my/repair-declarations, my/requests, my/flags, my/notices,
+  edge demo/offline/sync/status/videos, /health.
+ EDITS: POST /my/batches* still returns 403 NEEDS_APPROVAL for NEW batches
+  after approval; ad-hoc demo sessions are exempt. cameras approve*: on
+  approval, set setup_status approved; if centre was awaiting_camera_approval
+  and >=1 camera approved -> centre live.
+
+ RESPONSE SHAPES (authoritative; UIs rely on these)
+  LiveStatus = {camera_id, camera_name, centre_id, centre_code, centre_name,
+    district, state ("live"|"idle"|"offline"|"tampered"|"provisional"),
+    ts, age_s, interval_s, session{id,label,start_ts,end_ts}|null, people,
+    people_smooth, claimed|null, items{class:{present,in_use,idle,off}},
+    labels{class:label}, quality{ok,reasons}, thumb_url, spark[int],
+    model_version}
+  CalendarDay = {date, status ("ok"|"attention"|"critical"|"no_data"|
+    "holiday"|"upcoming"|"none"), updates, snapshots, sessions, people_max,
+    people_avg, claimed, observed, delta, flags{total,open,max_severity}|null,
+    uptime_pct, in_use_pct}
+  DayDetail = {date, summary(CalendarDay), sessions[{id,batch,label,start_ts,
+    end_ts,state,claimed,observed,ci_low,ci_high,delta,staff_verified,
+    snapshots}], timeline{interval_s, points[{t:"HH:MM:SS",people,
+    items{class:{present,in_use}}}]} (<=240 points, downsampled),
+    equipment[{class,label,sanctioned,declared,present_avg,present_max,
+    in_use_avg,in_use_pct,status}], flags[{id,type,severity,status,reason,
+    created_at,evidence_urls[]}], evidence[{id,ts,kind,url}],
+    camera_health[{ts,status,reason}], events[{ts,kind,text}]}
+  SnapshotRow = {id, ts, camera_id, people, items, quality}
+
+VISION PIPELINE SPEC
+------------------------------------------------------------------
+ detector: canonical names. COCO_TO_CANON = {"tv":"monitor","dining table":
+   "desk"}. If template.detector_backend=="coco" or (auto and every class in
+   COCO_OK) -> YOLO("yolo11n.pt") with the alias map; else YOLOWorld(
+   "yolov8s-worldv2.pt") with set_classes(template.detector_classes).
+   Cache models per (class set, tiling). Load once at first use (warm up
+   at startup with one dummy frame to avoid a slow first request).
+   COCO_OK = {person, chair, desk, monitor, laptop, keyboard, mouse,
+   "cell phone", bench, couch, book, bottle}. "desk" through COCO
+   "dining table" is a proxy; if eval shows weakness use YOLO-World.
+ Tiling: full frame + 2x2 overlapping tiles for Demo Lab/eval and for
+   cameras with live.tiling=true. Live default OFF.
+ Quality gate: dark(mean<25), covered(std<12), blurry(laplacian<40),
+   frozen(diff<0.5 with gap>=20 s), moved(phase shift>5 % vs reference,
+   only when a reference gray frame is cached).
+ Replay (C2): dhash per accepted frame every 60 s into frame_fingerprints;
+   hamming <=3 vs a different session/day on the same camera -> C2.
+ Cleanup: ROI by reference point; presence rule per template; subtract
+   verified staff (once per session total: only cameras with
+   subtract_staff=true subtract); if no staff verified subtract 1 and
+   S1 (raised once per session).
+ Usage: usage.item_usage() (section C).
+ Privacy/thumbnail: blur top 28 % of every person box; draw boxes with
+   labels for all classes; 640 px; JPEG q60 (<=60 KB); drop raw frame.
+ Demo scenarios (sample videos) still run through pipeline.analyse_hour().
+
+FLAG TYPES (flag_engine.evaluate; unchanged semantics)
+------------------------------------------------------------------
+ A1 A2 A3 A4 A5 E1 E2 E3 S1 C1 C2 C3 D1 U1 P1 as in v2.
+ margin = max(count_tolerance, ceil(0.10 * claimed)).
+ Severity by gap ratio (<15 low, <30 medium, <50 high, else critical),
+ +1 level if the same type repeats >=3 times in 7 days.
+ Live additions: all flags are upserted by dedupe_key; E2 uses the
+ snapshot "off" state (screen classes) over >=60 % of snapshots; E1 uses
+ present counts; "in use" alone never creates a flag (usage is reporting).
+ After any flag change: recompute_risk(centre_id) and update
+ daily_summaries.updated_at.
+
+INTEGRITY AND SYNC
+------------------------------------------------------------------
+ - Claims, observations, flags -> ledger (SHA-256 chain + Ed25519)
+   BEFORE sync, as in v2.
+ - Snapshots are NOT ledgered one by one. Every consolidation appends a
+   ledger entry kind "snapshot_batch" {camera_id, session_id, from_ts,
+   to_ts, n, digest = sha256 of "ts|people|items-json" lines}. Central
+   verification can recompute the digest from snapshots still inside the
+   TTL window.
+ - Offline writes: store(doc) tries Mongo (3 s timeout); on failure appends
+   ledger kind "snapshot" with the doc; sync_tick replays idempotently via
+   snap_key and re-applies timeline/summary updates only when the snapshot
+   was newly inserted.
+ - Offline toggle (Demo Lab) sets sync STATE; live_status is skipped.
+ - D1 flag on chain verification failure (as v2).
+
+PRIVACY AND SECURITY CHECKLIST
+------------------------------------------------------------------
+ - Trainees: no face/photo anywhere. Staff: consent flag, encrypted
+   embedding, own-record verification only (as v2).
+ - Browser agent: JPEG frames are sent over HTTPS to the edge backend,
+   decoded in memory, processed, dropped. No frame is ever written or
+   logged. Local preview exists only in the user's browser.
+ - Thumbnails always head-blurred. TTLs: live 1 d, routine 14 d, flag 90 d.
+ - Argon2, lockout, rate limits, rotating refresh, token_version, signed
+   URLs (60 s), insert-only audit log (as v2).
+ - Input validation: unknown enums rejected; strings capped; arrays <= 500;
+   frame size/resolution capped; interval_s clamped 5..120.
+ - HONEST LIMIT: in browser-agent mode the camera device is trusted (a
+   modified client could send a staged image). Replay/frozen/moved checks
+   reduce risk; production uses an on-LAN edge agent with device
+   certificates.
+
+KEY CODE ADDITIONS (copy as starting points; same style as Block 3)
+------------------------------------------------------------------
+ # FILE: app/services/vision/usage.py   (replaces equipment.py)
+ import cv2
+ SCREEN = {"monitor", "laptop", "tv"}
+ def _near(item, p, pad=0.15):
+     pw, ph = p[2] - p[0], p[3] - p[1]
+     x1, y1, x2, y2 = p[0] - pad * pw, p[1] - pad * ph, p[2] + pad * pw, p[3] + pad * ph
+     return min(x2, item[2]) > max(x1, item[0]) and min(y2, item[3]) > max(y1, item[1])
+ def screen_on(frame, box) -> bool:
+     x1, y1, x2, y2 = [max(0, int(v)) for v in box[:4]]
+     r = frame[y1:y2, x1:x2]
+     if r.size == 0: return False
+     g = cv2.cvtColor(r, cv2.COLOR_BGR2GRAY)
+     return bool(g.mean() > 70 or g.std() > 35)
+ def item_usage(frame, items, people, rules: dict) -> dict:
+     """items: non-person dets (x1,y1,x2,y2,conf,name) inside ROI; people: ALL person boxes in ROI;
+        rules: {class: operability}. -> {class:{present,in_use,idle,off}}"""
+     out = {}
+     for it in items:
+         c = it[5]; s = out.setdefault(c, {"present": 0, "in_use": 0, "idle": 0, "off": 0})
+         s["present"] += 1
+         mode = rules.get(c, "none")
+         if mode == "none": continue
+         if mode == "screen_on" and c in SCREEN and not screen_on(frame, it): s["off"] += 1
+         elif any(_near(it, p) for p in people): s["in_use"] += 1
+         else: s["idle"] += 1
+     return out
+
+ # FILE: app/services/vision/detector.py   (changes only)
+ COCO_TO_CANON = {"tv": "monitor", "dining table": "desk"}
+ COCO_OK = {"person","chair","desk","monitor","laptop","keyboard","mouse","cell phone","bench","couch","book","bottle"}
+ #  in __init__: use COCO model when all(c in COCO_OK for c in classes) and backend != "world"
+ #  in _predict: raw = names[int(b.cls)]; name = COCO_TO_CANON.get(raw, raw)  (YOLO-World returns canonical names already)
+
+ # FILE: app/services/vision/privacy.py   (changes only)
+ #  blurred_thumbnail(frame, person_boxes, labelled=[(x1,y1,x2,y2,name)], width=640):
+ #    blur head regions first, then draw each labelled box (person boxes in primary-ish BGR (166,70,67);
+ #    other classes in a second fixed colour per class from a small palette) with a small text label
+ #    (cv2.putText, scale 0.5). Return JPEG bytes q=60; shrink quality until <= 60 KB.
+
+ # FILE: app/services/files_store.py
+ from datetime import datetime, timedelta, timezone
+ from bson import Binary
+ from app.db.mongo import db
+ TTL = {"live": 1, "routine": 14, "flag": 90, "reference": 365}
+ def save_blob(_id: str, centre_id, jpeg: bytes, kind: str, session_id=None, camera_id=None):
+     now = datetime.now(timezone.utc)
+     db.evidence_blobs.replace_one({"_id": _id}, {"_id": _id, "centre_id": centre_id, "session_id": session_id,
+         "camera_id": camera_id, "kind": kind, "data": Binary(jpeg), "created_at": now,
+         "expire_at": now + timedelta(days=TTL[kind])}, upsert=True)
+     return _id
+
+ # FILE: app/services/live.py
+ import time, threading, statistics, hashlib, json
+ from collections import deque
+ from datetime import datetime, timezone
+ from zoneinfo import ZoneInfo
+ from app.core.config import settings
+ from app.db.mongo import db
+ from app.services import ledger
+ from app.services.consolidate import consolidate
+ from app.services.files_store import save_blob
+ from app.services.vision.detector import Detector
+ from app.services.vision.quality import quality_gate, dhash
+ from app.services.vision.cleanup import cleanup
+ from app.services.vision.usage import item_usage
+ from app.services.vision.privacy import blurred_thumbnail
+
+ IST = ZoneInfo("Asia/Kolkata")
+ _sem = threading.Semaphore(2)
+ _det: dict = {}
+ _st: dict = {}          # per camera: gray,t,bad,hist,pt(last timeline ts),ev(last routine thumb ts),n(since consolidate)
+
+ def _detector(tpl, tiling):
+     k = (tuple(tpl["detector_classes"]), bool(tiling))
+     if k not in _det: _det[k] = Detector(tpl["detector_classes"], float(tpl["min_confidence"]), tiling)
+     return _det[k]
+
+ def process_live_frame(cam, frame):
+     if not _sem.acquire(blocking=False): return {"accepted": False, "reason": "BUSY"}
+     try: return _process(cam, frame)
+     finally: _sem.release()
+
+ def _process(cam, frame):
+     t0, now = time.time(), datetime.now(timezone.utc)
+     cid, kid = cam["_id"], cam["centre_id"]
+     centre = db.centres.find_one({"_id": kid})
+     tpl = db.trade_templates.find_one({"_id": centre["trade_template_id"]})
+     sess = db.sessions.find_one({"centre_id": kid, "start_ts": {"$lte": now}, "end_ts": {"$gte": now}})
+     live = cam.get("live") or {}
+     interval = int(live.get("interval_s", settings.live_default_interval_s))
+     st = _st.setdefault(str(cid), {"gray": None, "t": 0.0, "bad": 0, "hist": deque(maxlen=5), "pt": 0.0, "ev": 0.0, "n": 0})
+     q = quality_gate(frame, st["gray"], (t0 - st["t"]) if st["t"] else 0)
+     st["gray"], st["t"] = q["gray"], t0
+     provisional = cam.get("setup_status") != "approved"
+     base = {"_id": cid, "centre_id": kid, "centre_code": centre["code"], "centre_name": centre["name"],
+             "district": centre.get("district"), "camera_name": cam["name"], "ts": now, "interval_s": interval,
+             "session": ({"id": str(sess["_id"]), "label": sess.get("label"), "start_ts": sess["start_ts"], "end_ts": sess["end_ts"]} if sess else None),
+             "model_version": None}
+     if not q["ok"]:
+         st["bad"] += 1
+         db.live_status.replace_one({"_id": cid}, {**base, "state": "tampered", "people": None, "people_smooth": None,
+              "items": {}, "quality": {"ok": False, "reasons": q["reasons"]}, "claimed": None, "thumb_id": None}, upsert=True)
+         _health(cam, "tampered", ",".join(q["reasons"]))
+         if sess and not provisional and st["bad"] == 3:
+             raise_flag(kid, sess["_id"], cid, "C1", "high",
+                        f"Camera quality problem: {', '.join(q['reasons'])}. Counts not evaluated.", f"{sess['_id']}:C1:{cid}")
+         return {"accepted": True, "state": "tampered", "reasons": q["reasons"], "next_interval_s": interval}
+     st["bad"] = 0; _health(cam, "online", None)
+     det = _detector(tpl, live.get("tiling", False))
+     dets = det.detect(frame)
+     sub = _staff_to_subtract(sess, cam)
+     c = cleanup(dets, frame.shape, cam.get("roi_polygon"), cam.get("zones"), tpl["presence_rule"], sub)
+     rules = {r["class"]: r["operability"] for r in tpl["equipment_rules"]}
+     items = item_usage(frame, c["equipment"], c["all_people"], rules)
+     people = c["people_count"]; st["hist"].append(people)
+     smooth = int(statistics.median(st["hist"]))
+     h, w = frame.shape[:2]
+     labelled = [(*b[:4], b[5]) for b in c["equipment"]]
+     thumb = blurred_thumbnail(frame, [p[:4] for p in c["all_people"]], labelled + [(*p[:4], "person") for p in c["counted_boxes_full"]] if "counted_boxes_full" in c else labelled)
+     save_blob(f"live_{cid}", kid, thumb, "live", camera_id=cid)
+     if time.time() - st["ev"] >= settings.routine_evidence_every_min * 60 and sess and not provisional:
+         save_blob(f"r_{cid}_{int(t0)}", kid, thumb, "routine", sess["_id"], cid); st["ev"] = time.time()
+     claim = db.attendance_claims.find_one({"session_id": sess["_id"]}, {"claimed_count": 1}) if sess else None
+     state = "provisional" if provisional else ("live" if sess else "idle")
+     db.live_status.replace_one({"_id": cid}, {**base, "state": state, "people": people, "people_smooth": smooth, "items": items,
+          "quality": {"ok": True, "reasons": []}, "claimed": claim["claimed_count"] if claim else None,
+          "model_version": det.version, "latency_ms": int((time.time() - t0) * 1000), "thumb_id": f"live_{cid}"}, upsert=True)
+     if sess and not provisional:
+         _record(cam, kid, sess, now, people, len(c["people_boxes"]), items, det.version, int((time.time() - t0) * 1000), st, tpl)
+     return {"accepted": True, "state": state, "people": people, "people_smooth": smooth, "items": items,
+             "boxes": [{"cls": b[5], "x1": b[0]/w, "y1": b[1]/h, "x2": b[2]/w, "y2": b[3]/h, "conf": round(b[4], 2)}
+                       for b in dets], "session": base["session"], "next_interval_s": interval}
+
+ def _record(cam, kid, sess, now, people, raw, items, ver, lat, st, tpl):
+     """snapshot + timeline + daily summary. Idempotent via snap_key."""
+     snap = {"centre_id": kid, "camera_id": cam["_id"], "session_id": sess["_id"], "ts": now, "people": people,
+             "people_raw": raw, "items": items, "quality": {"ok": True, "reasons": []}, "model_version": ver,
+             "latency_ms": lat, "snap_key": f"{cam['_id']}|{int(now.timestamp()*1000)}"}
+     try: db.snapshots.insert_one(snap)
+     except Exception as e:
+         if "duplicate" in str(e).lower(): return
+         ledger.append("snapshot", {"doc": snap, "centre_id": str(kid)}); return        # Atlas down -> outbox
+     day = now.astimezone(IST).date().isoformat()
+     inc = {"snapshots": 1, "people_sum": people}
+     mx = {"people_max": people}
+     for c, v in items.items():
+         inc[f"items.{c}.present_sum"] = v["present"]; inc[f"items.{c}.in_use_sum"] = v["in_use"]; mx[f"items.{c}.present_max"] = v["present"]
+     db.daily_summaries.update_one({"centre_id": kid, "date": day},
+         {"$inc": inc, "$max": mx, "$min": {"first_seen": now}, "$set": {"last_seen": now, "updated_at": now}}, upsert=True)
+     if time.time() - st["pt"] >= settings.live_timeline_gap_s:
+         pt = {"ts": now, "people": people, "items": {c: {"present": v["present"], "in_use": v["in_use"]} for c, v in items.items()}}
+         db.day_timelines.update_one({"camera_id": cam["_id"], "date": day},
+             {"$setOnInsert": {"centre_id": kid}, "$set": {"updated_at": now}, "$push": {"points": {"$each": [pt], "$slice": -2000}}}, upsert=True)
+         st["pt"] = time.time()
+     db.sessions.update_one({"_id": sess["_id"]}, {"$inc": {"done_captures": 1}, "$set": {"status": "active"}})
+     st["n"] += 1
+     if st["n"] >= settings.consolidate_every_snapshots:
+         st["n"] = 0; consolidate_session(sess["_id"], cam, tpl, final=False)
+
+ def consolidate_session(sid, cam, tpl, final=False):
+     snaps = list(db.snapshots.find({"session_id": sid, "camera_id": cam["_id"]}).sort("ts", -1).limit(int(tpl["max_frames"])))
+     if not snaps: return None
+     counts = [s["people"] for s in snaps]
+     res = consolidate(counts, tpl["count_tolerance"], float(tpl["agree_ratio"]))
+     eq = {}
+     for cls in {k for s in snaps for k in s["items"]}:
+         pres = [s["items"].get(cls, {}).get("present", 0) for s in snaps]
+         use = sum(s["items"].get(cls, {}).get("in_use", 0) for s in snaps); tot = max(1, sum(pres))
+         eq[cls] = {**consolidate(pres, tpl["count_tolerance"], float(tpl["agree_ratio"]), min_frames=3), "in_use_pct": round(100 * use / tot)}
+     state = "ok" if res["consistent"] else "uncertain"
+     bucket = snaps[0]["ts"].replace(minute=0, second=0, microsecond=0)
+     obs = {"centre_id": cam["centre_id"], "session_id": sid, "camera_id": cam["_id"], "hour_bucket": bucket, "source": "live",
+            "observed_count": res["observed"], "ci_low": res["ci_low"], "ci_high": res["ci_high"], "state": state,
+            "frames_used": len(snaps), "per_frame_counts": counts[::-1], "equipment": eq, "tamper": [],
+            "model_version": snaps[0].get("model_version")}
+     prev = db.observations.find_one({"session_id": sid, "camera_id": cam["_id"], "hour_bucket": bucket})
+     db.observations.update_one({"session_id": sid, "camera_id": cam["_id"], "hour_bucket": bucket, "source": "live"}, {"$set": obs}, upsert=True)
+     if not prev or (prev["observed_count"], prev["ci_low"], prev["ci_high"], prev["state"]) != (obs["observed_count"], obs["ci_low"], obs["ci_high"], state):
+         digest = hashlib.sha256("\n".join(f"{s['ts'].isoformat()}|{s['people']}|{json.dumps(s['items'], sort_keys=True)}" for s in snaps).encode()).hexdigest()
+         ledger.append("snapshot_batch", {"camera_id": str(cam["_id"]), "session_id": str(sid), "n": len(snaps), "digest": digest,
+                       "from_ts": snaps[-1]["ts"].isoformat(), "to_ts": snaps[0]["ts"].isoformat()})
+     _update_session_summary(sid, final)
+     if len(snaps) >= tpl["base_frames"]: evaluate_and_raise(sid, cam, tpl, obs, final)   # flag_engine.evaluate + upsert by dedupe_key
+     return obs
+ # Helpers to implement in the same file: _health(cam,status,reason) (insert camera_health_events only on state change,
+ # update cameras.status/last_seen/last_tamper_reason), _staff_to_subtract(sess,cam), raise_flag(...) (upsert by dedupe_key,
+ # ledger("flag"), recompute_risk), _update_session_summary(sid,final) (sum over cameras), evaluate_and_raise(...)
+ # (builds flag_engine ctx: claimed, enrolled, sanctioned_max, repairs, repeats; U1/C3 only if final).
+
+ # FILE: app/routers/live.py   (frame push)
+ import time, cv2, numpy as np
+ from fastapi import APIRouter, Depends, HTTPException, UploadFile
+ from starlette.concurrency import run_in_threadpool
+ from app.core.deps import require
+ from app.db.mongo import db, oid
+ from app.services import live
+ router = APIRouter(); _last: dict = {}
+ def _e(s, code, msg): raise HTTPException(s, detail={"detail": msg, "code": code})
+ @router.post("/my/cameras/{cid}/frame")
+ async def push_frame(cid: str, file: UploadFile, user=Depends(require("centre_admin", "trainer"))):
+     cam = db.cameras.find_one({"_id": oid(cid), "centre_id": user["centre_id"]})
+     if not cam or cam.get("source_kind") != "browser": _e(404, "NOT_FOUND", "Camera not found")
+     c = db.centres.find_one({"_id": user["centre_id"]}, {"status": 1})
+     if c["status"] in ("suspended", "terminated"): _e(403, "CENTRE_INACTIVE", "Centre not active")
+     interval = int((cam.get("live") or {}).get("interval_s", 10))
+     if time.time() - _last.get(cid, 0) < 0.5 * interval: _e(429, "TOO_FAST", "Sending too fast")
+     data = await file.read(1_500_001)
+     if len(data) > 1_500_000: _e(422, "FILE_TOO_LARGE", "Frame too large")
+     frame = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+     if frame is None or max(frame.shape[:2]) > 1920: _e(422, "BAD_FILE", "Unreadable frame")
+     _last[cid] = time.time()
+     return await run_in_threadpool(live.process_live_frame, cam, frame)
+
+ # FILE: app/services/calendar.py   (range + day status)
+ from datetime import date, datetime, timedelta, timezone
+ from zoneinfo import ZoneInfo
+ from app.db.mongo import db
+ IST = ZoneInfo("Asia/Kolkata"); OPEN = ["open","acknowledged","centre_responded","under_review","escalated"]
+ SEVN = {"$switch": {"branches": [{"case": {"$eq": ["$severity", "critical"]}, "then": 4},
+         {"case": {"$eq": ["$severity", "high"]}, "then": 3}, {"case": {"$eq": ["$severity", "medium"]}, "then": 2}], "default": 1}}
+ SEV = {4: "critical", 3: "high", 2: "medium", 1: "low"}
+ def calendar_range(centre_id, d_from: str, d_to: str):
+     start = datetime.fromisoformat(d_from).replace(tzinfo=IST).astimezone(timezone.utc)
+     end = (datetime.fromisoformat(d_to) + timedelta(days=1)).replace(tzinfo=IST).astimezone(timezone.utc)
+     summ = {s["date"]: s for s in db.daily_summaries.find({"centre_id": centre_id, "date": {"$gte": d_from, "$lte": d_to}})}
+     sess = {s["_id"]: s for s in db.sessions.aggregate([{"$match": {"centre_id": centre_id, "session_date": {"$gte": d_from, "$lte": d_to}}},
+         {"$group": {"_id": "$session_date", "n": {"$sum": 1}, "claimed": {"$sum": {"$ifNull": ["$summary.claimed", 0]}},
+                     "observed": {"$sum": {"$ifNull": ["$summary.observed", 0]}}, "have": {"$sum": {"$cond": [{"$ne": ["$summary", None]}, 1, 0]}},
+                     "planned": {"$sum": "$planned_captures"}, "done": {"$sum": "$done_captures"}}}])}
+     fl = {f["_id"]: f for f in db.flags.aggregate([{"$match": {"centre_id": centre_id, "created_at": {"$gte": start, "$lt": end}}},
+         {"$group": {"_id": {"$dateToString": {"format": "%Y-%m-%d", "date": "$created_at", "timezone": "Asia/Kolkata"}},
+                     "total": {"$sum": 1}, "open": {"$sum": {"$cond": [{"$in": ["$status", OPEN]}, 1, 0]}}, "sev": {"$max": SEVN}}}])}
+     hol = {h["holiday_date"] for h in db.holidays.find({"centre_id": centre_id, "holiday_date": {"$gte": d_from, "$lte": d_to}})}
+     today = datetime.now(IST).date().isoformat(); out = []; d = date.fromisoformat(d_from)
+     while d <= date.fromisoformat(d_to):
+         k = d.isoformat(); s, ss, f = summ.get(k), sess.get(k), fl.get(k)
+         snaps = (s or {}).get("snapshots", 0)
+         status = ("holiday" if k in hol else "upcoming" if k > today and ss else "none" if not ss and not s
+                   else "no_data" if not snaps else "critical" if f and f["sev"] >= 3 else "attention" if f and f["open"] else "ok")
+         inuse = sum(v.get("in_use_sum", 0) for v in (s or {}).get("items", {}).values()); pres = sum(v.get("present_sum", 0) for v in (s or {}).get("items", {}).values())
+         out.append({"date": k, "status": status, "snapshots": snaps, "updates": snaps + (f["total"] if f else 0) + (s or {}).get("claims", 0) + (s or {}).get("health_events", 0),
+             "sessions": ss["n"] if ss else 0, "people_max": (s or {}).get("people_max"), "people_avg": round(s["people_sum"] / snaps, 1) if snaps else None,
+             "claimed": ss["claimed"] if ss and ss["have"] else None, "observed": ss["observed"] if ss and ss["have"] else None,
+             "delta": (ss["claimed"] - ss["observed"]) if ss and ss["have"] else None,
+             "flags": {"total": f["total"], "open": f["open"], "max_severity": SEV[f["sev"]]} if f else None,
+             "uptime_pct": round(100 * ss["done"] / ss["planned"]) if ss and ss["planned"] else None,
+             "in_use_pct": round(100 * inuse / pres) if pres else None})
+         d += timedelta(days=1)
+     return out
+ # day_detail(centre_id, date): sessions (+summary), day_timelines points (merge cameras by minute, downsample to <=240),
+ # equipment (daily_summaries.items + centres.equipment sanctioned/declared + repairs), flags of the IST day (+evidence_urls),
+ # evidence_blobs of the day (kind routine/flag, signed urls), camera_health_events, events feed merged from claims, flags,
+ # health events and session open/close. Same function serves gov and centre routes (centre route checks ownership first).
+
+ # SERVICES: session_status_tick closes sessions whose end_ts passed: status closed (or missed if done_captures == 0 and
+ # the centre has an approved camera), runs consolidate_session(final=True) per camera, writes sessions.summary, bumps
+ # daily_summaries.updated_at. planned_captures = floor(duration_s / interval_s) set when the session first becomes active.
+
+DELTAS TO M-BLOCKS AND BLOCK 3 (apply these)
+------------------------------------------------------------------
+ init_db.py:
+  - indexes: live_status (_id only) + (centre_id); snapshots: (snap_key unique),
+    (camera_id, ts desc), (session_id, camera_id, ts), TTL on ts (14 d);
+    day_timelines: (camera_id, date) unique; daily_summaries: (centre_id, date)
+    unique; sessions: REPLACE unique (batch_id, session_date) with a PARTIAL
+    unique index (partialFilterExpression {batch_id: {$type: "objectId"}});
+    sessions (centre_id, start_ts, end_ts); flags: (dedupe_key unique sparse);
+    observations: unique (session_id, camera_id, hour_bucket) partial
+    {source: "live"}; evidence_blobs: REMOVE the created_at TTL, ADD TTL on
+    expire_at (expireAfterSeconds=0) and (centre_id, created_at desc).
+  - new plain collections: live_status, snapshots, day_timelines, daily_summaries.
+  - seed: rename "tv" -> "monitor" in the Computer Lab template; chair and desk
+    operability "in_use"; ADD template "Webcam Demo Room": detector_classes
+    ["person","chair","desk","monitor","laptop","keyboard","mouse","cell phone",
+    "book"], presence_rule "any", equipment_rules chair/desk/monitor/laptop
+    (operability in_use/in_use/screen_on/screen_on, required false).
+ sync.py: handle ledger kinds "snapshot" (replay _record writes keyed by snap_key)
+  and "snapshot_batch" (store in ledger_entries only).
+ files.py / sync.py: use files_store.save_blob; evidence ids for flags keep
+  "<hash16>_<i>" with kind "flag".
+ cleanup.py: also return counted_boxes_full (with conf,name) and keep
+  "equipment" = chairs + other objects (non-person) inside ROI.
+ pipeline.py (Demo Lab): unchanged API; uses usage.item_usage for status.
+ Remove equipment.py (superseded by usage.py).
+
+BUILD ORDER FOR THE BACKEND
+------------------------------------------------------------------
+ 1 config, mongo.py, security.py, deps.py, audit.py, init_db.py, auth, /me, MFA
+ 2 schemes/templates, public applications (+documents), approve (atomic),
+   direct create, credentials, users
+ 3 centres, cameras (+reference frame, source kinds, live settings), batches
+   (+generate_sessions), trainees (take_seat), staff, equipment, holidays
+ 4 vision services standalone (detector aliases, quality, cleanup, usage,
+   privacy) tested with a script on sample videos AND a webcam loop
+ 5 consolidate + flag_engine unit tests (pure functions)
+ 6 ledger + sync + files router + files_store
+ 7 live.py: process_live_frame, frame endpoint, live_status, demo session,
+   snapshots/timeline/summary writes
+ 8 calendar service + routes (range, day detail, snapshots), gov /live wall
+ 9 session_status_tick, consolidate_session(final), flag upserts, live_capture_tick
+10 flags router/actions, notices ladder, requests decide, reports, accuracy,
+   audit-log, edge demo
+11 eval script and results.json
+
+TEST CHECKLIST (must pass before demo)
+------------------------------------------------------------------
+ (All v2 tests remain.) NEW:
+ - Browser frame POST from a trainer of centre A to a camera of centre B -> 404.
+ - Frame POST faster than 0.5 x interval -> 429 TOO_FAST; oversize -> 422.
+ - No active session: live_status updates (state idle) but NO snapshots,
+   timelines or summaries are written.
+ - Provisional (unapproved) camera: live_status "provisional", nothing recorded,
+   no flags. After govt approval: recording starts.
+ - Black/covered frames: state tampered, no counts stored, C1 raised once after
+   3 consecutive bad frames (no duplicates on the 4th, 5th ...).
+ - One person at a desk with chair, monitor on: items show chair in_use 1,
+   monitor in_use 1, desk in_use 1; monitor with screen off -> off 1.
+ - live_status older than 3 x interval is reported as "offline".
+ - 100 snapshots -> day_timelines points <= 100 and spaced >= 30 s apart;
+   daily_summaries.snapshots == number of recordable frames (idempotent on
+   duplicate snap_key).
+ - Calendar range for a 31-day month executes <= 4 queries (no N+1) and returns
+   31 rows; day with sessions but no snapshots -> "no_data"; holiday -> "holiday".
+ - Day detail timeline is <= 240 points; equipment in_use_pct matches snapshots.
+ - Consolidation runs every N snapshots and at session close; flags upsert by
+   dedupe_key (same A1 never duplicates); U1/C3 only after close.
+ - Atlas unreachable: snapshots go to the SQLite outbox; after reconnect they sync
+   exactly once; timeline/summary counted once.
+ - Evidence TTL: live blob expire_at = +1 day, routine +14 d, flag +90 d.
+ - No raw frame on disk or in Mongo after 10 minutes of frames; thumbnails <= 60 KB
+   with blurred head regions.
+ - Concurrency: 5 simultaneous frame POSTs -> at most 2 processed, others BUSY.
+ - Mongo shell: TTL indexes on evidence_blobs.expire_at, snapshots.ts,
+   refresh_tokens, camera_health_events, frame_fingerprints.
