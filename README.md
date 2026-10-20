@@ -1,4 +1,4 @@
-# Dev_Skill SIH 2026 — Smart India Hackathon Project
+# NAZAR SIH 2026 — Smart India Hackathon Project by Code &  Coffee
 
 **Real-time Attendance & Compliance Monitoring System** for skill development centres using AI-powered camera analytics.
 
